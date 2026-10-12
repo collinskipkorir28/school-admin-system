@@ -1,0 +1,1197 @@
+from flask import Flask, render_template_string, request, redirect, url_for, flash, session, send_file
+import sqlite3
+from datetime import datetime, timedelta
+import os
+import io
+import shutil
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import base64
+from functools import wraps
+import hashlib
+import re
+
+app = Flask(__name__)
+app.secret_key = "school_secret_key_change_this_2026"
+app.permanent_session_lifetime = timedelta(minutes=30)  # Session timeout
+
+DB = "school.db"
+BACKUP_DIR = "backups"
+UPLOAD_FOLDER = "uploads"
+
+def get_db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
+    c.execute("SELECT * FROM users WHERE username='admin'")
+    if not c.fetchone():
+        c.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+                  ("admin", hash_password("admin123")))
+
+    c.execute('''CREATE TABLE IF NOT EXISTS classes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, deleted INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, deleted INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS students (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, admission_no TEXT UNIQUE, name TEXT NOT NULL,
+        gender TEXT, class_name TEXT, parent_phone TEXT, address TEXT, created_at TEXT, deleted INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS teachers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, subject TEXT, phone TEXT, email TEXT, deleted INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, date TEXT, status TEXT, UNIQUE(student_id, date))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, subject TEXT, marks REAL, term TEXT, year TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS fees (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, student_id INTEGER, amount REAL, paid_on TEXT, term TEXT, year TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS fee_structure (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, class_name TEXT, term TEXT, year TEXT, expected_amount REAL,
+        UNIQUE(class_name, term, year))''')
+
+    conn.commit()
+    conn.close()
+    for folder in [BACKUP_DIR, UPLOAD_FOLDER]:
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        # Session timeout check
+        if 'last_activity' in session:
+            last = datetime.fromisoformat(session['last_activity'])
+            if datetime.now() - last > timedelta(minutes=30):
+                session.clear()
+                flash("Session expired. Please login again.")
+                return redirect(url_for('login'))
+        session['last_activity'] = datetime.now().isoformat()
+        session.permanent = True
+        return f(*args, **kwargs)
+    return decorated
+
+def get_grade(marks):
+    if marks is None: return "-"
+    try:
+        marks = float(marks)
+    except:
+        return "-"
+    if marks >= 80: return "A"
+    elif marks >= 70: return "B"
+    elif marks >= 60: return "C"
+    elif marks >= 50: return "D"
+    else: return "F"
+
+def validate_phone(phone):
+    if not phone: return True
+    return bool(re.match(r'^[0-9+\-\s]{7,15}$', phone))
+
+def validate_marks(marks):
+    try:
+        m = float(marks)
+        return 0 <= m <= 100
+    except:
+        return False
+
+# ==================== BASE TEMPLATE ====================
+BASE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>School Admin System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f0f2f5; color: #333; line-height: 1.5; }
+        .navbar { background: #1a73e8; color: white; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 5px; align-items: center; position: sticky; top: 0; z-index: 100; }
+        .navbar a { color: white; text-decoration: none; font-weight: 600; font-size: 12.5px; padding: 5px 6px; border-radius: 4px; }
+        .navbar a:hover { background: rgba(255,255,255,0.15); }
+        .navbar .right { margin-left: auto; }
+        .container { max-width: 1100px; margin: 12px auto; padding: 0 12px; }
+        .card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
+        h1, h2, h3 { margin-bottom: 12px; color: #1a73e8; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+        th, td { border: 1px solid #e8e8e8; padding: 7px 6px; text-align: left; }
+        th { background: #1a73e8; color: white; }
+        tr:nth-child(even) { background: #f8f9fa; }
+        input, select, button, textarea { padding: 8px 10px; margin: 3px 2px; border-radius: 6px; border: 1px solid #ccc; font-size: 13.5px; }
+        button, .btn { background: #1a73e8; color: white; border: none; cursor: pointer; text-decoration: none; display: inline-block; font-weight: 600; }
+        button:hover, .btn:hover { background: #1557b0; }
+        .btn-danger { background: #dc3545; } .btn-danger:hover { background: #c82333; }
+        .btn-success { background: #28a745; }
+        .btn-warning { background: #ffc107; color: #000; }
+        .btn-sm { padding: 4px 8px; font-size: 12px; }
+        .success { background: #d4edda; color: #155724; padding: 10px; border-radius: 6px; margin-bottom: 12px; }
+        .error { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 6px; margin-bottom: 12px; }
+        .stats { display: flex; flex-wrap: wrap; gap: 10px; }
+        .stat-box { background: #e8f0fe; padding: 12px; border-radius: 10px; text-align: center; flex: 1; min-width: 90px; }
+        .stat-box h3 { margin: 0; color: #1a73e8; font-size: 20px; }
+        .form-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+        .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        img.chart { max-width: 100%; border-radius: 8px; margin-top: 8px; }
+        .recent { font-size: 13px; }
+        @media (max-width: 700px) {
+            .profile-grid { grid-template-columns: 1fr; }
+            .navbar a { font-size: 11.5px; padding: 4px 5px; }
+            table { font-size: 12px; }
+            .stat-box { min-width: 45%; }
+        }
+        @media print {
+            .navbar, .no-print { display: none !important; }
+            body { background: white; }
+            .card { box-shadow: none; border: 1px solid #ddd; page-break-inside: avoid; }
+        }
+    </style>
+</head>
+<body>
+    {% if session.logged_in %}
+    <div class="navbar no-print">
+        <a href="/">Dashboard</a>
+        <a href="/students">Students</a>
+        <a href="/classes">Classes</a>
+        <a href="/subjects">Subjects</a>
+        <a href="/teachers">Teachers</a>
+        <a href="/attendance">Attendance</a>
+        <a href="/attendance_summary">Att. Summary</a>
+        <a href="/results">Results</a>
+        <a href="/fees">Fees</a>
+        <a href="/fee_balance">Balances</a>
+        <a href="/reports">Reports</a>
+        <a href="/print_cards">Print Cards</a>
+        <a href="/backup">Backup</a>
+        <a href="/trash">Trash</a>
+        <a href="/change_password">Password</a>
+        <a href="/logout" class="right">Logout</a>
+    </div>
+    {% endif %}
+    <div class="container">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for msg in messages %}
+                    <div class="success">{{ msg }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        {{ content|safe }}
+    </div>
+    <script>
+        function confirmDelete(url) {
+            if (confirm("Move this record to Trash?")) {
+                window.location.href = url;
+            }
+        }
+    </script>
+</body>
+</html>
+'''
+
+# ==================== LOGIN ====================
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if session.get('logged_in'):
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username=?", (request.form['username'],)).fetchone()
+        conn.close()
+        if user and user['password'] == hash_password(request.form['password']):
+            session['logged_in'] = True
+            session['username'] = user['username']
+            session['last_activity'] = datetime.now().isoformat()
+            session.permanent = True
+            flash("Welcome back!")
+            return redirect(url_for('dashboard'))
+        flash("Wrong username or password")
+    content = '''
+    <div class="card" style="max-width:380px;margin:50px auto;">
+        <h2 style="text-align:center;">School Admin Login</h2>
+        <form method="POST">
+            <input name="username" placeholder="Username" required style="width:100%;margin-bottom:8px;"><br>
+            <input name="password" type="password" placeholder="Password" required style="width:100%;margin-bottom:8px;"><br>
+            <button type="submit" style="width:100%;">Login</button>
+        </form>
+        <p style="text-align:center;color:#666;font-size:13px;margin-top:14px;">Default: admin / admin123<br>Session expires after 30 minutes of inactivity</p>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/change_password', methods=['GET', 'POST'])
+@login_required
+def change_password():
+    if request.method == 'POST':
+        current = request.form['current']
+        new_pass = request.form['new_pass']
+        confirm = request.form['confirm']
+        conn = get_db()
+        user = conn.execute("SELECT * FROM users WHERE username=?", (session.get('username'),)).fetchone()
+        if not user or user['password'] != hash_password(current):
+            flash("Current password is incorrect")
+        elif new_pass != confirm:
+            flash("New passwords do not match")
+        elif len(new_pass) < 5:
+            flash("Password must be at least 5 characters")
+        else:
+            conn.execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_pass), session.get('username')))
+            conn.commit()
+            flash("Password changed successfully!")
+            conn.close()
+            return redirect(url_for('dashboard'))
+        conn.close()
+    content = '''
+    <div class="card" style="max-width:420px;margin:30px auto;">
+        <h2>Change Password</h2>
+        <form method="POST">
+            <input name="current" type="password" placeholder="Current Password" required style="width:100%;margin-bottom:8px;"><br>
+            <input name="new_pass" type="password" placeholder="New Password" required style="width:100%;margin-bottom:8px;"><br>
+            <input name="confirm" type="password" placeholder="Confirm New Password" required style="width:100%;margin-bottom:8px;"><br>
+            <button type="submit" style="width:100%;">Update Password</button>
+        </form>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+# ==================== DASHBOARD (Improved) ====================
+@app.route('/')
+@login_required
+def dashboard():
+    conn = get_db()
+    students = conn.execute("SELECT COUNT(*) FROM students WHERE deleted=0").fetchone()[0]
+    teachers = conn.execute("SELECT COUNT(*) FROM teachers WHERE deleted=0").fetchone()[0]
+    classes = conn.execute("SELECT COUNT(*) FROM classes WHERE deleted=0").fetchone()[0]
+    subjects = conn.execute("SELECT COUNT(*) FROM subjects WHERE deleted=0").fetchone()[0]
+    today = datetime.now().strftime("%Y-%m-%d")
+    present = conn.execute("SELECT COUNT(*) FROM attendance WHERE date=? AND status='Present'", (today,)).fetchone()[0]
+    total_fees = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fees").fetchone()[0]
+
+    # Recent students
+    recent_students = conn.execute("SELECT name, class_name, created_at FROM students WHERE deleted=0 ORDER BY id DESC LIMIT 5").fetchall()
+    # Recent payments
+    recent_fees = conn.execute('''SELECT s.name, f.amount, f.paid_on FROM fees f 
+                                  JOIN students s ON f.student_id=s.id WHERE s.deleted=0 
+                                  ORDER BY f.id DESC LIMIT 5''').fetchall()
+    # Top debtors (simple version)
+    debtors = conn.execute('''SELECT s.name, s.class_name, COALESCE(SUM(f.amount),0) as paid 
+                              FROM students s LEFT JOIN fees f ON s.id=f.student_id 
+                              WHERE s.deleted=0 GROUP BY s.id ORDER BY paid ASC LIMIT 5''').fetchall()
+    conn.close()
+
+    recent_s = "".join([f"<li>{r['name']} ({r['class_name']}) - {r['created_at']}</li>" for r in recent_students]) or "<li>No students yet</li>"
+    recent_f = "".join([f"<li>{r['name']} - {r['amount']:,.0f} on {r['paid_on']}</li>" for r in recent_fees]) or "<li>No payments yet</li>"
+    debt_list = "".join([f"<li>{r['name']} ({r['class_name']}) - Paid: {r['paid']:,.0f}</li>" for r in debtors]) or "<li>No data</li>"
+
+    content = f'''
+    <div class="card">
+        <h1>Dashboard</h1>
+        <div class="stats">
+            <div class="stat-box"><h3>{students}</h3><p>Students</p></div>
+            <div class="stat-box"><h3>{teachers}</h3><p>Teachers</p></div>
+            <div class="stat-box"><h3>{classes}</h3><p>Classes</p></div>
+            <div class="stat-box"><h3>{subjects}</h3><p>Subjects</p></div>
+            <div class="stat-box"><h3>{present}</h3><p>Present Today</p></div>
+            <div class="stat-box"><h3>{total_fees:,.0f}</h3><p>Fees Collected</p></div>
+        </div>
+    </div>
+    <div class="profile-grid">
+        <div class="card recent">
+            <h3>Recently Added Students</h3>
+            <ul>{recent_s}</ul>
+        </div>
+        <div class="card recent">
+            <h3>Recent Fee Payments</h3>
+            <ul>{recent_f}</ul>
+        </div>
+    </div>
+    <div class="card recent">
+        <h3>Students with Lowest Payments (Possible Debtors)</h3>
+        <ul>{debt_list}</ul>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+# ==================== CLASSES ====================
+@app.route('/classes')
+@login_required
+def classes():
+    conn = get_db()
+    rows = conn.execute("SELECT c.*, (SELECT COUNT(*) FROM students s WHERE s.class_name=c.name AND s.deleted=0) as student_count FROM classes c WHERE c.deleted=0 ORDER BY name").fetchall()
+    conn.close()
+    table = "<table><tr><th>Class Name</th><th>Students</th><th>Action</th></tr>"
+    for r in rows:
+        table += f'''<tr><td>{r['name']}</td><td>{r['student_count']}</td>
+            <td><a class="btn btn-sm btn-danger" href="javascript:confirmDelete('/delete_class/{r['id']}')">Delete</a></td></tr>'''
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Class Management</h2>
+        <form method="POST" action="/add_class">
+            <input name="name" placeholder="Class Name (e.g. Form 1A)" required>
+            <button type="submit">Add Class</button>
+        </form>
+        {table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_class', methods=['POST'])
+@login_required
+def add_class():
+    name = request.form['name'].strip()
+    if not name:
+        flash("Class name cannot be empty")
+        return redirect(url_for('classes'))
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO classes (name) VALUES (?)", (name,))
+        conn.commit()
+        flash("Class added!")
+    except:
+        flash("Class already exists")
+    conn.close()
+    return redirect(url_for('classes'))
+
+@app.route('/delete_class/<int:id>')
+@login_required
+def delete_class(id):
+    conn = get_db()
+    conn.execute("UPDATE classes SET deleted=1 WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    flash("Class moved to Trash")
+    return redirect(url_for('classes'))
+
+# ==================== SUBJECTS ====================
+@app.route('/subjects')
+@login_required
+def subjects():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM subjects WHERE deleted=0 ORDER BY name").fetchall()
+    conn.close()
+    table = "<table><tr><th>Subject Name</th><th>Action</th></tr>"
+    for r in rows:
+        table += f'''<tr><td>{r['name']}</td>
+            <td><a class="btn btn-sm btn-danger" href="javascript:confirmDelete('/delete_subject/{r['id']}')">Delete</a></td></tr>'''
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Subjects Management</h2>
+        <form method="POST" action="/add_subject">
+            <input name="name" placeholder="Subject Name" required>
+            <button type="submit">Add Subject</button>
+        </form>
+        {table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_subject', methods=['POST'])
+@login_required
+def add_subject():
+    name = request.form['name'].strip()
+    if not name:
+        flash("Subject name cannot be empty")
+        return redirect(url_for('subjects'))
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO subjects (name) VALUES (?)", (name,))
+        conn.commit()
+        flash("Subject added!")
+    except:
+        flash("Subject already exists")
+    conn.close()
+    return redirect(url_for('subjects'))
+
+@app.route('/delete_subject/<int:id>')
+@login_required
+def delete_subject(id):
+    conn = get_db()
+    conn.execute("UPDATE subjects SET deleted=1 WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    flash("Subject moved to Trash")
+    return redirect(url_for('subjects'))
+
+# ==================== STUDENTS ====================
+@app.route('/students')
+@login_required
+def students():
+    q = request.args.get('q', '').strip()
+    conn = get_db()
+    classes = conn.execute("SELECT name FROM classes WHERE deleted=0 ORDER BY name").fetchall()
+    if q:
+        rows = conn.execute('''SELECT * FROM students WHERE deleted=0 AND (name LIKE ? OR admission_no LIKE ? OR class_name LIKE ? OR parent_phone LIKE ?) ORDER BY id DESC''',
+                            (f'%{q}%', f'%{q}%', f'%{q}%', f'%{q}%')).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM students WHERE deleted=0 ORDER BY id DESC").fetchall()
+    conn.close()
+    class_options = "".join([f'<option value="{c["name"]}">{c["name"]}</option>' for c in classes])
+    table = "<table><tr><th>Adm No</th><th>Name</th><th>Gender</th><th>Class</th><th>Phone</th><th>Actions</th></tr>"
+    for r in rows:
+        table += f'''<tr>
+            <td>{r['admission_no']}</td><td>{r['name']}</td><td>{r['gender']}</td><td>{r['class_name']}</td><td>{r['parent_phone']}</td>
+            <td>
+                <a class="btn btn-sm" href="/student/{r['id']}">Profile</a>
+                <a class="btn btn-sm btn-danger" href="javascript:confirmDelete('/delete_student/{r['id']}')">Delete</a>
+            </td></tr>'''
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Students</h2>
+        <form method="GET" style="margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap;">
+            <input name="q" value="{q}" placeholder="Search..." style="flex:1;min-width:150px;">
+            <button type="submit">Search</button>
+            <a class="btn" href="/students">Clear</a>
+        </form>
+        <h3>Add Single Student</h3>
+        <form method="POST" action="/add_student">
+            <div class="form-row">
+                <input name="admission_no" placeholder="Admission No" required>
+                <input name="name" placeholder="Full Name" required>
+                <select name="gender"><option>Male</option><option>Female</option></select>
+                <select name="class_name" required><option value="">Select Class</option>{class_options}</select>
+                <input name="parent_phone" placeholder="Parent Phone">
+                <input name="address" placeholder="Address">
+                <button type="submit">Add Student</button>
+            </div>
+        </form>
+        <h3 style="margin-top:18px;">Bulk Import from Excel</h3>
+        <form method="POST" action="/import_students" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".xlsx,.xls" required>
+            <button type="submit">Import Students</button>
+        </form>
+        <p style="font-size:12px;color:#666;">Required columns: admission_no, name, gender, class_name</p>
+        {table}
+        <br><a class="btn btn-success" href="/export/students">Export to Excel</a>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_student', methods=['POST'])
+@login_required
+def add_student():
+    admission_no = request.form['admission_no'].strip()
+    name = request.form['name'].strip()
+    phone = request.form.get('parent_phone', '').strip()
+    if not admission_no or not name:
+         flash("Admission number and name are required")
+         return redirect(url_for('students'))
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO students (admission_no, name, gender, class_name, parent_phone, address, created_at) VALUES (?,?,?,?,?,?,?)",
+                     (admission_no, name, request.form['gender'], request.form['class_name'],
+                      phone, request.form.get('address', ''), datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
+        flash("Student added!")
+    except Exception as e:
+        flash(f"Error: {str(e)}")
+    conn.close()
+    return redirect(url_for('students'))
+
+@app.route('/import_students', methods=['POST'])
+@login_required
+def import_students():
+    if 'file' not in request.files or request.files['file'].filename == '':
+        flash("No file selected")
+        return redirect(url_for('students'))
+    try:
+        df = pd.read_excel(request.files['file'])
+        required = ['admission_no', 'name', 'gender', 'class_name']
+        for col in required:
+            if col not in df.columns:
+                flash(f"Missing column: {col}")
+                return redirect(url_for('students'))
+        conn = get_db()
+        success = errors = 0
+        for _, row in df.iterrows():
+            try:
+                conn.execute('''INSERT INTO students (admission_no, name, gender, class_name, parent_phone, address, created_at)
+                                VALUES (?,?,?,?,?,?,?)''',
+                             (str(row['admission_no']), str(row['name']), str(row.get('gender', 'Male')),
+                              str(row['class_name']), str(row.get('parent_phone', '')),
+                              str(row.get('address', '')), datetime.now().strftime("%Y-%m-%d")))
+                success += 1
+            except:
+                errors += 1
+        conn.commit()
+        conn.close()
+        flash(f"Import done: {success} added, {errors} failed")
+    except Exception as e:
+        flash(f"Import error: {str(e)}")
+    return redirect(url_for('students'))
+
+@app.route('/delete_student/<int:id>')
+@login_required
+def delete_student(id):
+    conn = get_db()
+    conn.execute("UPDATE students SET deleted=1 WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    flash("Student moved to Trash")
+    return redirect(url_for('students'))
+@app.route('/student/<int:id>')
+@login_required
+def student_profile(id):
+    conn = get_db()
+    student = conn.execute("SELECT * FROM students WHERE id=? AND deleted=0", (id,)).fetchone()
+    if not student:
+        flash("Student not found")
+        return redirect(url_for('students'))
+    attendance = conn.execute("SELECT * FROM attendance WHERE student_id=? ORDER BY date DESC LIMIT 30", (id,)).fetchall()
+    results = conn.execute("SELECT * FROM results WHERE student_id=? ORDER BY year DESC, term", (id,)).fetchall()
+    fees = conn.execute("SELECT * FROM fees WHERE student_id=? ORDER BY paid_on DESC", (id,)).fetchall()
+    total_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fees WHERE student_id=?", (id,)).fetchone()[0]
+    conn.close()
+    att_rows = "".join([f"<tr><td>{a['date']}</td><td>{a['status']}</td></tr>" for a in attendance]) or "<tr><td colspan='2'>No records</td></tr>"
+    res_rows = "".join([f"<tr><td>{r['subject']}</td><td>{r['marks']}</td><td>{get_grade(r['marks'])}</td><td>{r['term']}</td><td>{r['year']}</td></tr>" for r in results]) or "<tr><td colspan='5'>No results</td></tr>"
+    fee_rows = "".join([f"<tr><td>{f['amount']}</td><td>{f['paid_on']}</td><td>{f['term']}</td><td>{f['year']}</td></tr>" for f in fees]) or "<tr><td colspan='4'>No payments</td></tr>"
+    content = f'''
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+            <h2>Student Profile</h2>
+            <div class="no-print">
+                <a class="btn btn-warning" href="/report_card/{id}" target="_blank">Print Report Card</a>
+                <a class="btn" href="/students">← Back</a>
+            </div>
+        </div>
+        <p><strong>Admission No:</strong> {student['admission_no']}<br>
+        <strong>Name:</strong> {student['name']}<br>
+        <strong>Gender:</strong> {student['gender']}<br>
+        <strong>Class:</strong> {student['class_name']}<br>
+        <strong>Parent Phone:</strong> {student['parent_phone']}<br>
+        <strong>Address:</strong> {student['address']}<br>
+        <strong>Total Fees Paid:</strong> {total_paid:,.0f}</p>
+    </div>
+    <div class="profile-grid">
+        <div class="card"><h3>Recent Attendance</h3><table><tr><th>Date</th><th>Status</th></tr>{att_rows}</table></div>
+        <div class="card"><h3>Exam Results</h3><table><tr><th>Subject</th><th>Marks</th><th>Grade</th><th>Term</th><th>Year</th></tr>{res_rows}</table></div>
+    </div>
+    <div class="card"><h3>Fee Payments</h3><table><tr><th>Amount</th><th>Paid On</th><th>Term</th><th>Year</th></tr>{fee_rows}</table></div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/report_card/<int:id>')
+@login_required
+def report_card(id):
+    conn = get_db()
+    student = conn.execute("SELECT * FROM students WHERE id=?", (id,)).fetchone()
+    results = conn.execute("SELECT * FROM results WHERE student_id=? ORDER BY year DESC, term, subject", (id,)).fetchall()
+    total_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fees WHERE student_id=?", (id,)).fetchone()[0]
+    conn.close()
+    if not student: return "Not found", 404
+    res_rows = "".join([f"<tr><td>{r['subject']}</td><td>{r['marks']}</td><td>{get_grade(r['marks'])}</td><td>{r['term']}</td><td>{r['year']}</td></tr>" for r in results]) or "<tr><td colspan='5'>No results</td></tr>"
+    return f'''
+    <!DOCTYPE html><html><head><title>Report Card - {student['name']}</title>
+    <style>body{{font-family:Arial;padding:30px;max-width:800px;margin:auto}}h1,h2{{text-align:center;color:#1a73e8}}
+    table{{width:100%;border-collapse:collapse;margin-top:20px}}th,td{{border:1px solid #333;padding:8px}}th{{background:#1a73e8;color:white}}
+    @media print{{button{{display:none}}}}</style></head><body>
+    <h1>SCHOOL REPORT CARD</h1><h2>{student['name']}</h2>
+    <p><strong>Admission No:</strong> {student['admission_no']}<br><strong>Class:</strong> {student['class_name']}<br>
+    <strong>Gender:</strong> {student['gender']}<br><strong>Total Fees Paid:</strong> {total_paid:,.0f}<br>
+    <strong>Date:</strong> {datetime.now().strftime("%d %B %Y")}</p>
+    <h3>Academic Results</h3>
+    <table><tr><th>Subject</th><th>Marks</th><th>Grade</th><th>Term</th><th>Year</th></tr>{res_rows}</table>
+    <br><button onclick="window.print()">Print Report Card</button></body></html>'''
+
+# ==================== PRINT MULTIPLE REPORT CARDS ====================
+@app.route('/print_cards')
+@login_required
+def print_cards():
+    conn = get_db()
+    classes = conn.execute("SELECT name FROM classes WHERE deleted=0 ORDER BY name").fetchall()
+    conn.close()
+    options = "".join([f'<option value="{c["name"]}">{c["name"]}</option>' for c in classes])
+    content = f'''
+    <div class="card">
+        <h2>Print Multiple Report Cards</h2>
+        <form method="GET" action="/generate_cards">
+            <label>Select Class:</label>
+            <select name="class_name" required>
+                <option value="">Choose Class</option>
+                {options}
+            </select>
+            <button type="submit">Generate Report Cards</button>
+        </form>
+        <p style="margin-top:12px;color:#666;font-size:13px;">This will open a printable page with report cards for all students in the selected class.</p>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/generate_cards')
+@login_required
+def generate_cards():
+    class_name = request.args.get('class_name')
+    if not class_name:
+        flash("Please select a class")
+        return redirect(url_for('print_cards'))
+    conn = get_db()
+    students = conn.execute("SELECT * FROM students WHERE class_name=? AND deleted=0 ORDER BY name", (class_name,)).fetchall()
+    if not students:
+        conn.close()
+        flash("No students found in this class")
+        return redirect(url_for('print_cards'))
+
+    cards = ""
+    for s in students:
+        results = conn.execute("SELECT * FROM results WHERE student_id=? ORDER BY subject", (s['id'],)).fetchall()
+        total_paid = conn.execute("SELECT COALESCE(SUM(amount),0) FROM fees WHERE student_id=?", (s['id'],)).fetchone()[0]
+        res_rows = "".join([f"<tr><td>{r['subject']}</td><td>{r['marks']}</td><td>{get_grade(r['marks'])}</td><td>{r['term']}</td></tr>" for r in results]) or "<tr><td colspan='4'>No results</td></tr>"
+        cards += f'''
+        <div class="card" style="page-break-after:always;margin-bottom:30px;">
+            <h2 style="text-align:center;color:#1a73e8;">SCHOOL REPORT CARD</h2>
+            <h3 style="text-align:center;">{s['name']}</h3>
+            <p><strong>Admission No:</strong> {s['admission_no']} &nbsp; | &nbsp; <strong>Class:</strong> {s['class_name']}<br>
+            <strong>Gender:</strong> {s['gender']} &nbsp; | &nbsp; <strong>Fees Paid:</strong> {total_paid:,.0f}</p>
+            <table style="width:100%;border-collapse:collapse;">
+                <tr style="background:#1a73e8;color:white;"><th>Subject</th><th>Marks</th><th>Grade</th><th>Term</th></tr>
+                {res_rows}
+            </table>
+        </div>
+        '''
+    conn.close()
+    return f'''
+    <!DOCTYPE html><html><head><title>Report Cards - {class_name}</title>
+    <style>
+        body{{font-family:Arial;padding:20px}} table{{width:100%;border-collapse:collapse;margin-top:10px}}
+        th,td{{border:1px solid #333;padding:6px}} th{{background:#1a73e8;color:white}}
+        @media print{{.no-print{{display:none}} .card{{page-break-after:always}}}}
+    </style></head><body>
+    <div class="no-print" style="margin-bottom:20px;">
+        <button onclick="window.print()" style="padding:10px 20px;font-size:16px;">Print All Report Cards</button>
+        <a href="/print_cards" style="margin-left:15px;">← Back</a>
+    </div>
+    {cards}
+    </body></html>'''
+# ==================== TEACHERS ====================
+@app.route('/teachers')
+@login_required
+def teachers():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM teachers WHERE deleted=0 ORDER BY id DESC").fetchall()
+    conn.close()
+    table = "<table><tr><th>Name</th><th>Subject</th><th>Phone</th><th>Email</th><th>Action</th></tr>"
+    for r in rows:
+        table += f"<tr><td>{r['name']}</td><td>{r['subject']}</td><td>{r['phone']}</td><td>{r['email']}</td>"
+        table += f"<td><a class='btn btn-sm btn-danger' href=\"javascript:confirmDelete('/delete_teacher/{r['id']}')\">Delete</a></td></tr>"
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Teachers</h2>
+        <form method="POST" action="/add_teacher">
+            <div class="form-row">
+                <input name="name" placeholder="Full Name" required>
+                <input name="subject" placeholder="Subject" required>
+                <input name="phone" placeholder="Phone">
+                <input name="email" placeholder="Email">
+                <button type="submit">Add Teacher</button>
+            </div>
+        </form>
+        {table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_teacher', methods=['POST'])
+@login_required
+def add_teacher():
+    name = request.form['name'].strip()
+    phone = request.form.get('phone', '').strip()
+    if not name:
+        flash("Name is required")
+        return redirect(url_for('teachers'))
+    if phone and not validate_phone(phone):
+        flash("Invalid phone number")
+        return redirect(url_for('teachers'))
+    conn = get_db()
+    conn.execute("INSERT INTO teachers (name, subject, phone, email) VALUES (?,?,?,?)",
+                 (name, request.form['subject'], phone, request.form.get('email', '')))
+    conn.commit()
+    conn.close()
+    flash("Teacher added!")
+    return redirect(url_for('teachers'))
+
+@app.route('/delete_teacher/<int:id>')
+@login_required
+def delete_teacher(id):
+    conn = get_db()
+    conn.execute("UPDATE teachers SET deleted=1 WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    flash("Teacher moved to Trash")
+    return redirect(url_for('teachers'))
+# ==================== ATTENDANCE ====================
+@app.route('/attendance')
+@login_required
+def attendance():
+    class_filter = request.args.get('class', '')
+    selected_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+    conn = get_db()
+    classes = conn.execute("SELECT name FROM classes WHERE deleted=0 ORDER BY name").fetchall()
+    if class_filter:
+        students = conn.execute("SELECT id, name, admission_no, class_name FROM students WHERE deleted=0 AND class_name=? ORDER BY name", (class_filter,)).fetchall()
+    else:
+        students = conn.execute("SELECT id, name, admission_no, class_name FROM students WHERE deleted=0 ORDER BY class_name, name").fetchall()
+    existing = {r['student_id']: r['status'] for r in conn.execute("SELECT student_id, status FROM attendance WHERE date=?", (selected_date,)).fetchall()}
+    conn.close()
+    class_options = '<option value="">All Classes</option>' + "".join([f'<option value="{c["name"]}" {"selected" if c["name"]==class_filter else ""}>{c["name"]}</option>' for c in classes])
+    form = f'''
+    <form method="GET" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <label>Date:</label><input type="date" name="date" value="{selected_date}" onchange="this.form.submit()">
+        <label>Class:</label><select name="class" onchange="this.form.submit()">{class_options}</select>
+    </form>
+    <form method="POST" action="/save_attendance">
+        <input type="hidden" name="date" value="{selected_date}">
+        <table><tr><th>Adm No</th><th>Name</th><th>Class</th><th>Status</th></tr>'''
+    for s in students:
+        current = existing.get(s['id'], 'Present')
+        form += f'''<tr><td>{s['admission_no']}</td><td>{s['name']}</td><td>{s['class_name']}</td>
+            <td><select name="status_{s['id']}">
+                <option value="Present" {"selected" if current=="Present" else ""}>Present</option>
+                <option value="Absent" {"selected" if current=="Absent" else ""}>Absent</option>
+                <option value="Late" {"selected" if current=="Late" else ""}>Late</option>
+            </select></td></tr>'''
+    form += '</table><br><button type="submit">Save Attendance</button></form>'
+    content = f'''
+    <form method="GET" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <label>Date:</label><input type="date" name="date" value="{selected_date}" onchange="this.form.submit()">
+        <label>Class:</label><select name="class" onchange="this.form.submit()">{class_options}</select>
+    </form>
+    <form method="POST" action="/save_attendance">
+        <input type="hidden" name="date" value="{selected_date}">
+        <table><tr><th>Adm No</th><th>Name</th><th>Class</th><th>Status</th></tr>'''
+    for s in students:
+        current = existing.get(s['id'], 'Present')
+        form += f'''<tr><td>{s['admission_no']}</td><td>{s['name']}</td><td>{s['class_name']}</td>
+            <td><select name="status_{s['id']}">
+                <option value="Present" {"selected" if current=="Present" else ""}>Present</option>
+                <option value="Absent" {"selected" if current=="Absent" else ""}>Absent</option>
+                <option value="Late" {"selected" if current=="Late" else ""}>Late</option>
+            </select></td></tr>'''
+    form += '</table><br><button type="submit">Save Attendance</button></form>'
+    content = f'''
+    <div class="card">
+        <h2>Mark Attendance</h2>
+        <p style="color:#666;font-size:13px;">One record per student per day.</p>
+        {form}
+        <br><a class="btn btn-success" href="/export/attendance">Export Attendance</a>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/save_attendance', methods=['POST'])
+@login_required
+def save_attendance():
+    date = request.form['date']
+    conn = get_db()
+    for key in request.form:
+        if key.startswith('status_'):
+            sid = key.split('_')[1]
+            status = request.form[key]
+            existing = conn.execute("SELECT id FROM attendance WHERE student_id=? AND date=?", (sid, date)).fetchone()
+            if existing:
+                conn.execute("UPDATE attendance SET status=? WHERE student_id=? AND date=?", (status, sid, date))
+            else:
+                conn.execute("INSERT INTO attendance (student_id, date, status) VALUES (?,?,?)", (sid, date, status))
+    conn.commit()
+    conn.close()
+    flash("Attendance saved!")
+    return redirect(url_for('attendance', date=date))
+
+@app.route('/attendance_summary')
+@login_required
+def attendance_summary():
+    selected_date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
+    class_filter = request.args.get('class', '')
+    conn = get_db()
+    classes = conn.execute("SELECT name FROM classes WHERE deleted=0 ORDER BY name").fetchall()
+    query = '''SELECT s.class_name, COUNT(*) as total,
+               SUM(CASE WHEN a.status='Present' THEN 1 ELSE 0 END) as present,
+               SUM(CASE WHEN a.status='Absent' THEN 1 ELSE 0 END) as absent,
+               SUM(CASE WHEN a.status='Late' THEN 1 ELSE 0 END) as late
+               FROM attendance a JOIN students s ON a.student_id = s.id
+               WHERE a.date = ? AND s.deleted = 0'''
+    params = [selected_date]
+    if class_filter:
+        query += " AND s.class_name = ?"
+        params.append(class_filter)
+    query += " GROUP BY s.class_name ORDER BY s.class_name"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    class_options = '<option value="">All Classes</option>' + "".join([f'<option value="{c["name"]}" {"selected" if c["name"]==class_filter else ""}>{c["name"]}</option>' for c in classes])
+    table = "<table><tr><th>Class</th><th>Total</th><th>Present</th><th>Absent</th><th>Late</th><th>Attendance %</th></tr>"
+    for r in rows:
+        pct = (r['present'] / r['total'] * 100) if r['total'] > 0 else 0
+        table += f"<tr><td>{r['class_name']}</td><td>{r['total']}</td><td>{r['present']}</td><td>{r['absent']}</td><td>{r['late']}</td><td>{pct:.1f}%</td></tr>"
+    table += "</table>" if rows else "<p>No attendance data for this date.</p>"
+    content = f'''
+    <div class="card">
+        <h2>Attendance Summary</h2>
+        <form method="GET" style="margin-bottom:15px;display:flex;flex-wrap:wrap;gap:8px;">
+            <label>Date:</label><input type="date" name="date" value="{selected_date}">
+            <label>Class:</label><select name="class">{class_options}</select>
+            <button type="submit">View</button>
+        </form>
+        {table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+# ==================== RESULTS ====================
+@app.route('/results')
+@login_required
+def results():
+    conn = get_db()
+    students = conn.execute("SELECT id, name, admission_no FROM students WHERE deleted=0").fetchall()
+    subjects = conn.execute("SELECT name FROM subjects WHERE deleted=0 ORDER BY name").fetchall()
+    rows = conn.execute('''SELECT r.*, s.name, s.admission_no FROM results r 
+                           JOIN students s ON r.student_id = s.id WHERE s.deleted=0 ORDER BY r.id DESC LIMIT 100''').fetchall()
+    conn.close()
+    options = "".join([f"<option value='{s['id']}'>{s['admission_no']} - {s['name']}</option>" for s in students])
+    subject_options = "".join([f"<option value='{s['name']}'>{s['name']}</option>" for s in subjects])
+    table = "<table><tr><th>Adm No</th><th>Name</th><th>Subject</th><th>Marks</th><th>Grade</th><th>Term</th><th>Year</th></tr>"
+    for r in rows:
+        table += f"<tr><td>{r['admission_no']}</td><td>{r['name']}</td><td>{r['subject']}</td><td>{r['marks']}</td><td>{get_grade(r['marks'])}</td><td>{r['term']}</td><td>{r['year']}</td></tr>"
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Exam Results</h2>
+        <form method="POST" action="/add_result">
+            <div class="form-row">
+                <select name="student_id" required>{options}</select>
+                <select name="subject" required><option value="">Select Subject</option>{subject_options}</select>
+                <input name="marks" type="number" step="0.01" min="0" max="100" placeholder="Marks (0-100)" required>
+                <input name="term" placeholder="Term" required>
+                <input name="year" value="{datetime.now().year}" required>
+                <button type="submit">Add Result</button>
+            </div>
+        </form>
+        <h3>Recent Results</h3>{table}
+        <br><a class="btn btn-success" href="/export/results">Export to Excel</a>
+        <a class="btn" href="/ranking">View Ranking</a>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_result', methods=['POST'])
+@login_required
+def add_result():
+    marks = request.form['marks']
+    if not validate_marks(marks):
+        flash("Marks must be between 0 and 100")
+        return redirect(url_for('results'))
+    conn = get_db()
+    conn.execute("INSERT INTO results (student_id, subject, marks, term, year) VALUES (?,?,?,?,?)",
+                 (request.form['student_id'], request.form['subject'], marks,
+                  request.form['term'], request.form['year']))
+    conn.commit()
+    conn.close()
+    flash("Result added!")
+    return redirect(url_for('results'))
+
+@app.route('/ranking')
+@login_required
+def ranking():
+    term = request.args.get('term', '')
+    year = request.args.get('year', str(datetime.now().year))
+    conn = get_db()
+    query = '''SELECT s.admission_no, s.name, s.class_name, AVG(r.marks) as average, COUNT(r.id) as subjects
+               FROM results r JOIN students s ON r.student_id = s.id
+               WHERE r.year = ? AND s.deleted = 0'''
+    params = [year]
+    if term:
+        query += " AND r.term = ?"
+        params.append(term)
+    query += " GROUP BY s.id ORDER BY average DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    table = "<table><tr><th>Rank</th><th>Adm No</th><th>Name</th><th>Class</th><th>Average</th><th>Grade</th><th>Subjects</th></tr>"
+    for i, r in enumerate(rows, 1):
+        table += f"<tr><td>{i}</td><td>{r['admission_no']}</td><td>{r['name']}</td><td>{r['class_name']}</td><td>{r['average']:.1f}</td><td>{get_grade(r['average'])}</td><td>{r['subjects']}</td></tr>"
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Student Ranking</h2>
+        <form method="GET" style="margin-bottom:12px;">
+            <input name="term" value="{term}" placeholder="Term (optional)">
+            <input name="year" value="{year}" placeholder="Year">
+            <button type="submit">Filter</button>
+        </form>
+        {table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+# ==================== FEES ====================
+@app.route('/fees')
+@login_required
+def fees():
+    conn = get_db()
+    students = conn.execute("SELECT id, name, admission_no FROM students WHERE deleted=0").fetchall()
+    rows = conn.execute('''SELECT f.*, s.name, s.admission_no FROM fees f 
+                           JOIN students s ON f.student_id = s.id WHERE s.deleted=0 ORDER BY f.id DESC LIMIT 100''').fetchall()
+    conn.close()
+    options = "".join([f"<option value='{s['id']}'>{s['admission_no']} - {s['name']}</option>" for s in students])
+    table = "<table><tr><th>Adm No</th><th>Name</th><th>Amount</th><th>Paid On</th><th>Term</th><th>Year</th></tr>"
+    for r in rows:
+        table += f"<tr><td>{r['admission_no']}</td><td>{r['name']}</td><td>{r['amount']}</td><td>{r['paid_on']}</td><td>{r['term']}</td><td>{r['year']}</td></tr>"
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Fee Collection</h2>
+        <form method="POST" action="/add_fee">
+            <div class="form-row">
+                <select name="student_id" required>{options}</select>
+                <input name="amount" type="number" step="0.01" min="0" placeholder="Amount" required>
+                <input name="term" placeholder="Term" required>
+                <input name="year" value="{datetime.now().year}" required>
+                <button type="submit">Record Payment</button>
+            </div>
+        </form>
+        <h3>Recent Payments</h3>{table}
+        <br><a class="btn btn-success" href="/export/fees">Export to Excel</a>
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/add_fee', methods=['POST'])
+@login_required
+def add_fee():
+    try:
+        amount = float(request.form['amount'])
+        if amount <= 0:
+            flash("Amount must be greater than 0")
+            return redirect(url_for('fees'))
+    except:
+        flash("Invalid amount")
+        return redirect(url_for('fees'))
+    conn = get_db()
+    conn.execute("INSERT INTO fees (student_id, amount, paid_on, term, year) VALUES (?,?,?,?,?)",
+                 (request.form['student_id'], amount, datetime.now().strftime("%Y-%m-%d"),
+                  request.form['term'], request.form['year']))
+    conn.commit()
+    conn.close()
+    flash("Fee recorded!")
+    return redirect(url_for('fees'))
+
+@app.route('/fee_balance')
+@login_required
+def fee_balance():
+    term = request.args.get('term', 'Term 1')
+    year = request.args.get('year', str(datetime.now().year))
+    conn = get_db()
+    structures = {f"{r['class_name']}|{r['term']}|{r['year']}": r['expected_amount'] for r in conn.execute("SELECT * FROM fee_structure").fetchall()}
+    students = conn.execute("SELECT id, admission_no, name, class_name FROM students WHERE deleted=0 ORDER BY class_name, name").fetchall()
+    paid = {r['student_id']: r['total'] for r in conn.execute("SELECT student_id, SUM(amount) as total FROM fees WHERE term=? AND year=? GROUP BY student_id", (term, year)).fetchall()}
+    conn.close()
+    table = "<table><tr><th>Adm No</th><th>Name</th><th>Class</th><th>Expected</th><th>Paid</th><th>Balance</th></tr>"
+    for s in students:
+        key = f"{s['class_name']}|{term}|{year}"
+        expected = structures.get(key, 0)
+        paid_amt = paid.get(s['id'], 0)
+        balance = expected - paid_amt
+        color = "color:red;" if balance > 0 else "color:green;"
+        table += f"<tr><td>{s['admission_no']}</td><td>{s['name']}</td><td>{s['class_name']}</td><td>{expected:,.0f}</td><td>{paid_amt:,.0f}</td><td style='{color}'>{balance:,.0f}</td></tr>"
+    table += "</table>"
+    content = f'''
+    <div class="card">
+        <h2>Fee Balances</h2>
+        <form method="GET" style="margin-bottom:12px;">
+            <input name="term" value="{term}" placeholder="Term">
+            <input name="year" value="{year}" placeholder="Year">
+            <button type="submit">Filter</button>
+        </form>
+        <h3>Set Expected Fees</h3>
+        <form method="POST" action="/set_fee_structure">
+            <input name="class_name" placeholder="Class" required>
+            <input name="term" placeholder="Term" value="{term}" required>
+            <input name="year" placeholder="Year" value="{year}" required>
+            <input name="expected_amount" type="number" step="0.01" min="0" placeholder="Expected Amount" required>
+            <button type="submit">Set Expected Fee</button>
+        </form>
+        <h3>Student Balances ({term} {year})</h3>{table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/set_fee_structure', methods=['POST'])
+@login_required
+def set_fee_structure():
+    try:
+        amount = float(request.form['expected_amount'])
+        if amount < 0:
+            flash("Amount cannot be negative")
+            return redirect(url_for('fee_balance'))
+    except:
+        flash("Invalid amount")
+        return redirect(url_for('fee_balance'))
+    conn = get_db()
+    try:
+        conn.execute('''INSERT INTO fee_structure (class_name, term, year, expected_amount) VALUES (?,?,?,?)
+                        ON CONFLICT(class_name, term, year) DO UPDATE SET expected_amount=excluded.expected_amount''',
+                     (request.form['class_name'], request.form['term'], request.form['year'], amount))
+        conn.commit()
+        flash("Fee structure updated!")
+    except Exception as e:
+        flash(str(e))
+    conn.close()
+    return redirect(url_for('fee_balance'))
+
+# ==================== TRASH ====================
+@app.route('/trash')
+@login_required
+def trash():
+    conn = get_db()
+    students = conn.execute("SELECT id, admission_no, name, class_name FROM students WHERE deleted=1").fetchall()
+    teachers = conn.execute("SELECT id, name, subject FROM teachers WHERE deleted=1").fetchall()
+    classes = conn.execute("SELECT id, name FROM classes WHERE deleted=1").fetchall()
+    subjects = conn.execute("SELECT id, name FROM subjects WHERE deleted=1").fetchall()
+    conn.close()
+    s_table = "<table><tr><th>Adm No</th><th>Name</th><th>Class</th><th>Action</th></tr>" + "".join([f"<tr><td>{r['admission_no']}</td><td>{r['name']}</td><td>{r['class_name']}</td><td><a class='btn btn-sm btn-success' href='/restore/student/{r['id']}'>Restore</a></td></tr>" for r in students]) + "</table>" if students else "<p>No deleted students</p>"
+    t_table = "<table><tr><th>Name</th><th>Subject</th><th>Action</th></tr>" + "".join([f"<tr><td>{r['name']}</td><td>{r['subject']}</td><td><a class='btn btn-sm btn-success' href='/restore/teacher/{r['id']}'>Restore</a></td></tr>" for r in teachers]) + "</table>" if teachers else "<p>No deleted teachers</p>"
+    c_table = "<table><tr><th>Class</th><th>Action</th></tr>" + "".join([f"<tr><td>{r['name']}</td><td><a class='btn btn-sm btn-success' href='/restore/class/{r['id']}'>Restore</a></td></tr>" for r in classes]) + "</table>" if classes else "<p>No deleted classes</p>"
+    sub_table = "<table><tr><th>Subject</th><th>Action</th></tr>" + "".join([f"<tr><td>{r['name']}</td><td><a class='btn btn-sm btn-success' href='/restore/subject/{r['id']}'>Restore</a></td></tr>" for r in subjects]) + "</table>" if subjects else "<p>No deleted subjects</p>"
+    content = f'''
+    <div class="card">
+        <h2>Trash / Recycle Bin</h2>
+        <h3>Deleted Students</h3>{s_table}
+        <h3>Deleted Teachers</h3>{t_table}
+        <h3>Deleted Classes</h3>{c_table}
+        <h3>Deleted Subjects</h3>{sub_table}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/restore/<entity>/<int:id>')
+@login_required
+def restore(entity, id):
+    conn = get_db()
+    table_map = {'student': 'students', 'teacher': 'teachers', 'class': 'classes', 'subject': 'subjects'}
+    if entity in table_map:
+        conn.execute(f"UPDATE {table_map[entity]} SET deleted=0 WHERE id=?", (id,))
+        conn.commit()
+        flash(f"{entity.capitalize()} restored!")
+    conn.close()
+    return redirect(url_for('trash'))
+# ==================== REPORTS ====================
+@app.route('/reports')
+@login_required
+def reports():
+    conn = get_db()
+    att = conn.execute("SELECT status, COUNT(*) as cnt FROM attendance GROUP BY status").fetchall()
+    fees_m = conn.execute("SELECT strftime('%Y-%m', paid_on) as month, SUM(amount) as total FROM fees GROUP BY month ORDER BY month").fetchall()
+    avg_marks = conn.execute("SELECT subject, AVG(marks) as avg FROM results GROUP BY subject").fetchall()
+    conn.close()
+    def make_chart(labels, values, title, kind='bar'):
+        plt.figure(figsize=(7, 3.5))
+        if kind == 'pie':
+            plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
+        else:
+            plt.bar(labels, values, color='#1a73e8')
+            plt.xticks(rotation=40, ha='right')
+        plt.title(title)
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        img = base64.b64encode(buf.read()).decode('utf-8')
+        plt.close()
+        return f'<img class="chart" src="data:image/png;base64,{img}">'
+    att_chart = make_chart([a['status'] for a in att], [a['cnt'] for a in att], "Attendance Overview", 'pie') if att else "<p>No data</p>"
+    fee_chart = make_chart([f['month'] for f in fees_m], [f['total'] for f in fees_m], "Fees by Month") if fees_m else "<p>No data</p>"
+    marks_chart = make_chart([m['subject'] for m in avg_marks], [m['avg'] for m in avg_marks], "Average Marks by Subject") if avg_marks else "<p>No data</p>"
+    content = f'''
+    <div class="card">
+        <h2>Reports & Charts</h2>
+        <h3>Attendance Overview</h3>{att_chart}
+        <h3>Fees Collection</h3>{fee_chart}
+        <h3>Average Marks</h3>{marks_chart}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+# ==================== BACKUP ====================
+@app.route('/backup')
+@login_required
+def backup_page():
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')], reverse=True) if os.path.exists(BACKUP_DIR) else []
+    list_html = "<ul>" + "".join([f"<li>{b} — <a class='btn btn-sm' href='/restore_backup/{b}'>Restore</a></li>" for b in backups]) + "</ul>" if backups else "<p>No backups yet</p>"
+    content = f'''
+    <div class="card">
+        <h2>Database Backup & Restore</h2>
+        <form method="POST" action="/create_backup"><button type="submit">Create New Backup Now</button></form>
+        <h3>Available Backups</h3>{list_html}
+    </div>
+    '''
+    return render_template_string(BASE, content=content)
+
+@app.route('/create_backup', methods=['POST'])
+@login_required
+def create_backup():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    shutil.copy2(DB, os.path.join(BACKUP_DIR, f"school_backup_{timestamp}.db"))
+    flash("Backup created successfully!")
+    return redirect(url_for('backup_page'))
+
+@app.route('/restore_backup/<filename>')
+@login_required
+def restore_backup(filename):
+    src = os.path.join(BACKUP_DIR, filename)
+    if os.path.exists(src):
+        shutil.copy2(src, DB)
+        flash(f"Database restored from {filename}")
+    else:
+        flash("Backup file not found")
+    return redirect(url_for('backup_page'))
+
+# ==================== EXPORT ====================
+@app.route('/export/<table>')
+@login_required
+def export(table):
+    conn = get_db()
+    if table == 'students':
+        df = pd.read_sql_query("SELECT * FROM students WHERE deleted=0", conn)
+    elif table == 'results':
+        df = pd.read_sql_query('''SELECT s.admission_no, s.name, r.subject, r.marks, r.term, r.year 
+                                  FROM results r JOIN students s ON r.student_id = s.id WHERE s.deleted=0''', conn)
+    elif table == 'fees':
+        df = pd.read_sql_query('''SELECT s.admission_no, s.name, f.amount, f.paid_on, f.term, f.year 
+                                  FROM fees f JOIN students s ON f.student_id = s.id WHERE s.deleted=0''', conn)
+    elif table == 'attendance':
+        df = pd.read_sql_query('''SELECT s.admission_no, s.name, a.date, a.status 
+                                  FROM attendance a JOIN students s ON a.student_id = s.id WHERE s.deleted=0''', conn)
+    else:
+        conn.close()
+        return "Invalid", 400
+    conn.close()
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name=table.capitalize())
+    output.seek(0)
+    return send_file(output, download_name=f"{table}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                     as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+# ==================== RUN ====================
+if __name__ == '__main__':
+    init_db()
+    print("\n================================================")
+    print("  School Admin System - FULLY COMPLETE")
+    print("  Open → http://127.0.0.1:5000")
+    print("  Login → admin / admin123")
+    print("  Session timeout: 30 minutes")
+    print("================================================\n")
+    app.run(host='127.0.0.1', port=5000, debug=False)

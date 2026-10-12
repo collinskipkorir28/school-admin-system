@@ -1,0 +1,7 @@
+*.db
+backups/
+uploads/
+__pycache__/
+*.pyc
+.env
+*.xlsx
