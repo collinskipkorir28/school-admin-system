@@ -1186,8 +1186,9 @@ def export(table):
                      as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 # ==================== RUN ====================
-if __name__ == '__main__':
     init_db()
+if __name__ == '__main__':
+    
     print("\n================================================")
     print("  School Admin System - FULLY COMPLETE")
     print("  Open → http://127.0.0.1:5000")
